@@ -3,6 +3,120 @@ import torch.nn as nn
 import numpy as np
 
 
+class MaskMatrix:
+    """
+    掩码矩阵管理类
+    
+    用于管理和分配掩码矩阵，维护矩阵的占用状态，确保新分配的掩码不会覆盖已占用的位置。
+    
+    功能特点：
+    - 维护一个二进制状态矩阵（0表示空闲，1表示已占用）
+    - 支持固定大小的掩码分配
+    - 自动更新内部状态，避免位置冲突
+    """
+    
+    def __init__(self, matrix_shape, allocation_size):
+        """
+        初始化掩码矩阵管理器
+        
+        Args:
+            matrix_shape (tuple): 掩码矩阵的维度，格式为(m, n)
+            allocation_size (int): 每次分配的固定数量（分配后不可更改）
+        """
+        self.matrix_shape = matrix_shape
+        self.allocation_size = allocation_size
+        
+        # 初始化状态矩阵，0表示空闲，1表示已占用
+        self.state_matrix = torch.zeros(matrix_shape, dtype=torch.int32)
+        
+        # 记录总的可用位置数
+        self.total_positions = matrix_shape[0] * matrix_shape[1]
+        self.allocated_positions = 0
+        
+    def get_available_positions(self):
+        """
+        获取当前可用位置的数量
+        
+        Returns:
+            int: 可用位置数量
+        """
+        return self.total_positions - self.allocated_positions
+    
+    def get_state_matrix(self):
+        """
+        获取当前状态矩阵的副本
+        
+        Returns:
+            torch.Tensor: 状态矩阵副本
+        """
+        return self.state_matrix.clone()
+    
+    def create_mask(self):
+        """
+        在空闲位置创建新的掩码
+        
+        在当前状态矩阵中找到空闲位置（值为0的位置），分配指定数量的位置，
+        将这些位置标记为已占用（设为1），并返回新创建的掩码矩阵。
+        
+        Returns:
+            torch.Tensor: 新创建的掩码矩阵，形状与matrix_shape相同
+                         新分配的位置为1，其他位置为0
+                         
+        Raises:
+            RuntimeError: 当可用位置不足时抛出异常
+        """
+        # 检查是否有足够的空闲位置
+        available_count = self.get_available_positions()
+        if available_count < self.allocation_size:
+            raise RuntimeError(
+                f"可用位置不足：需要 {self.allocation_size} 个位置，但只有 {available_count} 个可用位置"
+            )
+        
+        # 找到所有空闲位置的索引
+        free_positions = torch.where(self.state_matrix == 0)
+        free_indices = list(zip(free_positions[0].tolist(), free_positions[1].tolist()))
+        
+        # 随机选择要分配的位置（也可以按顺序选择）
+        import random
+        selected_indices = random.sample(free_indices, self.allocation_size)
+        
+        # 创建新的掩码矩阵
+        new_mask = torch.zeros(self.matrix_shape, dtype=torch.float32)
+        
+        # 更新状态矩阵和新掩码
+        for row, col in selected_indices:
+            self.state_matrix[row, col] = 1  # 标记为已占用
+            new_mask[row, col] = 1.0  # 在新掩码中标记
+        
+        # 更新已分配位置计数
+        self.allocated_positions += self.allocation_size
+        
+        return new_mask
+    
+    def reset(self):
+        """
+        重置状态矩阵，清空所有分配
+        """
+        self.state_matrix.fill_(0)
+        self.allocated_positions = 0
+    
+    def get_allocation_info(self):
+        """
+        获取分配信息
+        
+        Returns:
+            dict: 包含分配统计信息的字典
+        """
+        return {
+            'matrix_shape': self.matrix_shape,
+            'allocation_size': self.allocation_size,
+            'total_positions': self.total_positions,
+            'allocated_positions': self.allocated_positions,
+            'available_positions': self.get_available_positions(),
+            'utilization_rate': self.allocated_positions / self.total_positions
+        }
+
+
 class FourierExpansionModule(nn.Module):
     """
     傅立叶参数扩展组件
@@ -252,3 +366,38 @@ if __name__ == "__main__":
     print(f"被掩码位置参数变化: {masked_positions_changed:.6f}")
     print(f"未被掩码位置参数变化: {unmasked_positions_changed:.6f}")
     print(f"掩码功能正常工作: {masked_positions_changed < 1e-6}")
+    
+    # 测试MaskMatrix类
+    print("\n测试MaskMatrix类...")
+    
+    # 创建一个8x8的掩码矩阵管理器，每次分配10个位置
+    mask_manager = MaskMatrix(matrix_shape=(8, 8), allocation_size=10)
+    
+    print(f"初始状态: {mask_manager.get_allocation_info()}")
+    
+    # 创建第一个掩码
+    mask1 = mask_manager.create_mask()
+    print(f"第一次分配后: {mask_manager.get_allocation_info()}")
+    print(f"第一个掩码:\n{mask1}")
+    
+    # 创建第二个掩码
+    mask2 = mask_manager.create_mask()
+    print(f"第二次分配后: {mask_manager.get_allocation_info()}")
+    print(f"第二个掩码:\n{mask2}")
+    
+    # 验证掩码不重叠
+    overlap = torch.sum(mask1 * mask2)
+    print(f"掩码重叠检查（应为0）: {overlap.item()}")
+    
+    # 显示当前状态矩阵
+    print(f"当前状态矩阵:\n{mask_manager.get_state_matrix()}")
+    
+    # 尝试分配超出可用位置的掩码
+    try:
+        for i in range(10):  # 尝试多次分配直到空间不足
+            new_mask = mask_manager.create_mask()
+            print(f"第{i+3}次分配成功")
+    except RuntimeError as e:
+        print(f"预期的错误: {e}")
+    
+    print(f"最终状态: {mask_manager.get_allocation_info()}")
